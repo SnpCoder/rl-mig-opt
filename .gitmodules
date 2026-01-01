@@ -1,0 +1,20 @@
+[submodule "lib/mockturtle"]
+	path = lib/mockturtle
+	url = https://github.com/lsils/mockturtle.git
+[submodule "lib/pybind11"]
+	path = lib/pybind11
+	url = https://github.com/pybind/pybind11.git
+[submodule "lib/parallel_hashmap"]
+	path = lib/parallel_hashmap
+	url = https://github.com/greg7mdp/parallel-hashmap.git
+[submodule "lib/lorina"]
+	path = lib/lorina
+	url = https://github.com/hriener/lorina.git
+[submodule "lib/kitty"]
+	path = lib/kitty
+	url = https://github.com/lsils/kitty.git
+[submodule "lib/fmt"]
+	path = lib/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "lib/abc"]
+	path = lib/abc

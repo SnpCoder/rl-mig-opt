@@ -18,3 +18,8 @@
 	url = https://github.com/fmtlib/fmt.git
 [submodule "lib/abc"]
 	path = lib/abc
+[submodule "lib/bill"]
+	path = lib/bill
+	url = https://github.com/lsils/bill.git
+[submodule "lib/percy"]
+	path = lib/percy

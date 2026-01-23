@@ -21,6 +21,7 @@ env/
 venv/
 
 lib/
+lib/abc/
 **/.gitmodules.bak
 
 benchmarks/

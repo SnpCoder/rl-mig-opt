@@ -20,6 +20,32 @@ add_compile_options(-Wno-return-type)
 add_compile_options(-Wno-sign-compare)
 add_compile_options(-Wno-implicit-function-declaration) # 针对部分老代码
 
+# =================================================================
+# [新增] 自动修复 percy 和 kitty 的命名冲突 (Auto-patching)
+# =================================================================
+find_program(SED_TOOL sed)
+
+if(SED_TOOL)
+    message(STATUS "[Auto-Patch] Found sed: Patching percy library for 'is_normal' ambiguity...")
+    
+    # 定义 percy 头文件路径
+    set(PERCY_INC "${CMAKE_CURRENT_SOURCE_DIR}/lib/percy/include/percy")
+
+    # 1. 修复 spec.hpp
+    execute_process(COMMAND ${SED_TOOL} -i "s/!is_normal(functions\\[h\\])/!kitty::is_normal(functions[h])/g" ${PERCY_INC}/spec.hpp)
+
+    # 2. 修复 partial_dag.hpp (同时修复 is_normal 和 is_trivial)
+    # 注意：这里匹配特定的 if 语句结构以避免误伤
+    execute_process(COMMAND ${SED_TOOL} -i "s/if (is_normal(tt) && !is_trivial(tt))/if (kitty::is_normal(tt) \\&\\& !kitty::is_trivial(tt))/g" ${PERCY_INC}/partial_dag.hpp)
+
+    # 3. 修复 ssv_encoder.hpp
+    execute_process(COMMAND ${SED_TOOL} -i "s/if (!is_normal(tt))/if (!kitty::is_normal(tt))/g" ${PERCY_INC}/encoders/ssv_encoder.hpp)
+    
+    message(STATUS "[Auto-Patch] Patching complete.")
+else()
+    message(WARNING "[Auto-Patch] 'sed' tool not found! You might encounter ambiguous overload errors in percy library.")
+endif()
+
 # ==========================================
 # 2. 精确查找源文件 (白名单模式)
 # ==========================================

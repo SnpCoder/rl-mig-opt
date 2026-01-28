@@ -11,158 +11,244 @@ if build_path not in sys.path:
 try:
     import mig_core
 except ImportError as e:
-    print(f"\n[Error] Cannot import mig_core module!")
+    print(f"\n[Error] Cannot import mig_core module! Make sure you compiled the C++ project.")
     sys.exit(1)
 
 class MigOptEnv(gym.Env):
-    def __init__(self, aig_file):
+    def __init__(self, aig_files_list, target_mode='depth'):
         super(MigOptEnv, self).__init__()
-        self.aig_path = aig_file
         
+        self.target_mode = target_mode.lower()
+        valid_modes = ['depth', 'area', 'balanced']
+        if self.target_mode not in valid_modes:
+            raise ValueError(f"Invalid target_mode: {self.target_mode}. Must be one of {valid_modes}")
+        
+        print(f"[Env] Initialized with Optimization Mode: {self.target_mode.upper()}")
+
+        # load aig file list
+        if isinstance(aig_files_list, str):
+            self.aig_files = [aig_files_list]
+        else:
+            self.aig_files = aig_files_list
+
+        # initialize C++ manager
+        self.current_aig_path = self.aig_files[0]
         try:
-            self.mig_manager = mig_core.MigManager(self.aig_path)
+            self.mig_manager = mig_core.MigManager(self.current_aig_path)
         except Exception as e:
             print(f"C++ Init Failed: {e}")
             sys.exit(1)
 
+        self.update_initial_stats()
+        
+        # 0:Rewrite, 1:Balance, 2:Resub, 3:Refactor
+        self.action_space = spaces.Discrete(4)
+
+        # 11-dim
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32
+        )
+        
+        self.last_action = -1 
+        self.steps = 0
+        self.max_steps = 40 
+        self.repeat_count = 0 
+
+    def update_initial_stats(self):
         self.initial_area = float(self.mig_manager.get_node_count())
         self.initial_depth = float(self.mig_manager.get_depth())
         
         if self.initial_area == 0: self.initial_area = 1.0
         if self.initial_depth == 0: self.initial_depth = 1.0
-
-        # Action 0: Rewrite (Algebraic) - 小修小补
-        # Action 1: Balance (SOP)       - 深度核武器 (副作用：面积爆炸)
-        # Action 2: Resub               - 面积吸尘器 (专门修补 Balance 后的烂摊子)
-        # Action 3: RewriteAgg          - 深度重构
-        self.action_space = spaces.Discrete(4)
-
-        # 观察空间增加到 5 维
-        # [Norm_Area, Norm_Depth, Last_Action, Progress, Area_State_Flag]
-        self.observation_space = spaces.Box(
-            low=0.0, high=10.0, shape=(5,), dtype=np.float32
-        )
         
-        self.last_action = -1.0
-        self.steps = 0
-        self.max_steps = 40 # 增加步数，给它足够的时间“破坏再修复”
-        self.consecutive_no_ops = 0
+        self.initial_adp = self.initial_area * self.initial_depth
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.mig_manager.reset(self.aig_path)
+
+        # randomly select a circuit
+        for _ in range(10):
+            try:
+                self.current_aig_path = np.random.choice(self.aig_files)
+                self.mig_manager.reset(self.current_aig_path)
+                if self.mig_manager.get_node_count() > 0:
+                    break
+            except:
+                continue
         
-        self.last_action = -1.0
+        self.update_initial_stats()
+        self.last_action = -1
         self.steps = 0
-        self.consecutive_no_ops = 0
+        self.repeat_count = 0
 
-        raw_area = self.mig_manager.get_node_count()
-        raw_depth = self.mig_manager.get_depth()
-        
-        state = self._get_state(raw_area, raw_depth)
-        info = {"raw_area": raw_area, "raw_depth": raw_depth}
-        return state, info
+        return self._get_obs()
 
-    def _get_state(self, area, depth):
-        # Area_State_Flag: 1.0 表示面积膨胀了(红灯), 0.0 表示安全(绿灯)
-        is_bloated = 1.0 if area > self.initial_area else 0.0
+    def _get_obs(self):
+        cur_area = float(self.mig_manager.get_node_count())
+        cur_depth = float(self.mig_manager.get_depth())
         
-        return np.array([
-            area / self.initial_area,
-            depth / self.initial_depth,
-            (self.last_action + 1) / 4.0,
-            self.steps / self.max_steps,
-            is_bloated 
+        return self._compute_state_vector(cur_area, cur_depth), {
+            "raw_area": cur_area, 
+            "raw_depth": cur_depth,
+            "filename": os.path.basename(self.current_aig_path)
+        }
+
+    def _compute_state_vector(self, cur_area, cur_depth):
+        # normalize
+        norm_area = cur_area / self.initial_area
+        norm_depth = cur_depth / self.initial_depth
+        
+        # 2. 相对密度
+        init_density = self.initial_area / (self.initial_depth + 1e-5)
+        cur_density = cur_area / (cur_depth + 1e-5)
+        rel_density = cur_density / (init_density + 1e-5)
+
+        progress = self.steps / float(self.max_steps)
+
+        repeat_penalty_feature = min(self.repeat_count / 5.0, 1.0)
+        
+        is_bloated = 1.0 if cur_area > self.initial_area else 0.0
+
+        # 6. 动作历史 (One-Hot)
+        action_one_hot = np.zeros(5, dtype=np.float32)
+        if self.last_action == -1:
+            action_one_hot[0] = 1.0
+        else:
+            action_one_hot[self.last_action + 1] = 1.0
+
+        """
+        Observation Space Description (Shape: 11,)
+        -------------------------------------------------------
+        [0] norm_area      : Float, Cur_Area / Init_Area. (<1.0 is better)
+        [1] norm_depth     : Float, Cur_Depth / Init_Depth. (<1.0 is better)
+        [2] rel_density    : Float, Relative circuit density (Area/Depth ratio).
+        [3] progress       : Float, Step / Max_Steps (0.0 -> 1.0).
+        [4] repeat_penalty : Float, Penalty intensity for repeating actions.
+        [5] is_bloated     : Float, 1.0 if Cur_Area > Init_Area, else 0.0.
+        
+        [6-10] Action History (One-Hot Encoding):
+            [6] : Start / None
+            [7] : Rewrite
+            [8] : Balance
+            [9] : Resub
+            [10]: Refactor
+        -------------------------------------------------------
+        """
+        state = np.array([
+            norm_area, norm_depth, rel_density, progress, 
+            repeat_penalty_feature, is_bloated
         ], dtype=np.float32)
+        
+        return np.concatenate((state, action_one_hot))
 
     def step(self, action):
         self.steps += 1
         
-        prev_area = self.mig_manager.get_node_count()
-        prev_depth = self.mig_manager.get_depth()
+        prev_area = float(self.mig_manager.get_node_count())
+        prev_depth = float(self.mig_manager.get_depth())
+        prev_adp = prev_area * prev_depth
 
-        # 执行动作
         if action == 0: self.mig_manager.rewrite()
         elif action == 1: self.mig_manager.balance()
         elif action == 2: self.mig_manager.resub()
-        elif action == 3: self.mig_manager.rewrite_aggressive()
+        elif action == 3: self.mig_manager.refactor()
 
-        cur_area = self.mig_manager.get_node_count()
-        cur_depth = self.mig_manager.get_depth()
-
-        # 计算归一化差异 (正数=变好，负数=变差)
-        area_diff_norm = (prev_area - cur_area) / self.initial_area
-        depth_diff_norm = (prev_depth - cur_depth) / self.initial_depth
-
-        # ==========================================
-        # 核心逻辑：动态权重 (Dynamic Weighting)
-        # ==========================================
+        cur_area = float(self.mig_manager.get_node_count())
+        cur_depth = float(self.mig_manager.get_depth())
+        cur_adp = cur_area * cur_depth
         
-        # 场景 A: 面积膨胀了 (红灯模式)
-        # 任务：全力修复面积，深度只要不恶化就行
-        if cur_area > self.initial_area:
-            w_area = 10.0  # 疯狂奖励面积减少
-            w_depth = 1.0  # 深度暂时不重要
-            
-            # 这种状态下，如果能减少面积，给巨额奖励
-            base_reward = (w_area * area_diff_norm) + (w_depth * depth_diff_norm)
-            
-            # 额外惩罚：依然处于膨胀状态，每一步都扣分（迫使它尽快修好）
-            base_reward -= 0.5 
+        # compute reward
+        reward = 0.0
+        
+        if prev_area != 0:
+            area_imp = (prev_area - cur_area) / prev_area
+        if prev_depth != 0:
+            depth_imp = (prev_depth - cur_depth) / prev_depth
+        if prev_adp != 0:
+            adp_imp = (prev_adp - cur_adp) / prev_adp
 
-        # 场景 B: 面积安全 (绿灯模式)
-        # 任务：全力冲击深度，允许牺牲一点面积
+        if self.target_mode == 'depth':
+            score = (0.3 * area_imp) + (0.7 * depth_imp)
+
+            if score > 0: reward += score * 60.0
+            else: reward += score * 30.0
+            
+            if cur_area > prev_area and prev_area != 0: reward -= 20.0 * (cur_area / prev_area)
+            if cur_depth > prev_depth and prev_depth != 0: reward -= 30.0 * (cur_depth / prev_depth)
+
+        elif self.target_mode == 'area':
+            score = (0.7 * area_imp) + (0.3 * depth_imp)
+
+            if score > 0: reward += score * 60.0
+            else: reward += score * 30.0
+            
+            if cur_area > prev_area and prev_area != 0: reward -= 30.0 * (cur_area / prev_area)
+            if cur_depth > prev_depth and prev_depth != 0: reward -= 20.0 * (cur_depth / prev_depth)
+
+        elif self.target_mode == 'balanced':
+            score = (0.5 * area_imp) + (0.5 * depth_imp)
+            
+            if score > 0: reward += score * 60.0
+            else: reward += score * 30.0
+            
+            if cur_area > prev_area and prev_area != 0: reward -= 20.0 * (cur_area / prev_area)
+            if cur_depth > prev_depth and prev_depth != 0: reward -= 20.0 * (cur_depth / prev_depth)
+
+        # restriction and penalty
+        
+        # no operation
+        is_no_op = (prev_area == cur_area and prev_depth == cur_depth)
+        if is_no_op:
+            reward -= 2.0
+
+        # repeat
+        if action == self.last_action:
+            self.repeat_count += 1
+            if is_no_op:
+                reward -= 1.0 * (self.repeat_count ** 2)
+            elif self.repeat_count > 5:
+                reward -= 0.5 * self.repeat_count
         else:
-            w_area = 2.0
-            w_depth = 8.0  # 疯狂奖励深度减少
-            
-            base_reward = (w_area * area_diff_norm) + (w_depth * depth_diff_norm)
-            
-            # 特殊激励：如果深度真的降了，即使面积稍微涨了一点，也不要罚太重
-            if depth_diff_norm > 0 and area_diff_norm < 0:
-                base_reward += 1.0 # 鼓励这种“有价值的牺牲”
+            self.repeat_count = 0
 
-        reward = base_reward
-
-        # ==========================================
-        # 辅助逻辑
-        # ==========================================
-
-        # 1. 遏制无脑刷屏 (No-Op Killer)
-        # 如果动作无效，给予随次数指数增长的惩罚
-        if prev_area == cur_area and prev_depth == cur_depth:
-            self.consecutive_no_ops += 1
-            reward -= (1.0 * self.consecutive_no_ops) # -1, -2, -3...
-        else:
-            self.consecutive_no_ops = 0 # 重置
-
-        # 2. 终止条件
         terminated = False
         truncated = False
 
-        # 如果连续 5 次操作都无效，直接重开，别浪费时间了
-        if self.consecutive_no_ops >= 5:
+        success = False
+        if self.target_mode == 'depth':
+            if cur_area < self.initial_area * 1.1 and cur_depth < self.initial_depth * 0.75:
+                success = True
+        elif self.target_mode == 'area':
+            if cur_area < self.initial_area * 0.8 and cur_depth <= self.initial_depth * 1.1:
+                success = True
+        elif self.target_mode == 'balanced':
+            if cur_area < self.initial_area * 0.9 and cur_depth < self.initial_depth * 0.85:
+                success = True
+
+        if success:
+            reward += 100.0
+            terminated = True
+
+        # truncated if too large
+        bloat_limit = 3.0 if self.target_mode == 'depth' else 1.5
+        if cur_area > self.initial_area * bloat_limit:
+            reward -= 100.0
             truncated = True
-            reward -= 5.0
 
-        # 如果面积实在太大 (2倍)，判定为不可挽回，强制结束
-        if cur_area > self.initial_area * 2.0:
+        # truncated if take the same action while no improvment
+        if self.repeat_count > 8 and is_no_op:
             truncated = True
-            reward -= 10.0
+            reward -= 20.0
 
-        # 3. 完美结局奖励 (Jackpot)
-        # 如果两者都显著优化 (>20%)，给一个巨额奖金
-        if cur_area < self.initial_area * 0.8 and cur_depth < self.initial_depth * 0.8:
-            reward += 10.0
-
-        # 更新状态
         self.last_action = action
-        state = self._get_state(cur_area, cur_depth)
-
+        state = self._compute_state_vector(cur_area, cur_depth)
+        
         info = {
             "raw_area": cur_area,
             "raw_depth": cur_depth,
-            "action_name": ["Rewrite", "Balance", "Resub", "RewriteAgg"][action]
+            "action_name": ["Rewrite", "Balance", "Resub", "Refactor"][action],
+            "is_success": terminated,
+            "mode": self.target_mode
         }
-
+        
         return state, reward, terminated, truncated, info

@@ -20,14 +20,20 @@ __pycache__/
 env/
 venv/
 
-lib/
-lib/abc/
-**/.gitmodules.bak
+# lib/
+# lib/abc/
+# **/.gitmodules.bak
 
 benchmarks/
 # benchmarks/*_cleaned/
 # *.v.bak
 # *.blif.bak
+
+mig_opt_logs/
+
+model/
+
+results/
 
 .DS_Store
 Thumbs.db
